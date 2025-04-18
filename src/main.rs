@@ -14,6 +14,8 @@
 // image = "0.24"
 // bytes = "1.4"
 
+use std::fmt::format;
+
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 use tokio::runtime;
 use tokio::runtime::Handle;
@@ -45,19 +47,6 @@ impl Screen {
             self.texture =
                 Some(ctx.load_texture(format!("tex_{}", self.id), image, TextureOptions::NEAREST));
         }
-    }
-    /// Draw screen content
-    fn draw(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.group(|ui| {
-            ui.label(format!("Screen #{}: ", self.id));
-            self.update_texture(ctx);
-            if let Some(tex) = &self.texture {
-                let size = tex.size_vec2();
-                ui.image((tex.id(), size));
-            } else {
-                ui.label("Waiting for frames…");
-            }
-        });
     }
 }
 
@@ -134,47 +123,34 @@ impl eframe::App for MyApp {
             });
         });
 
-        // // Main area: dynamic tiling handling single vs multiple
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let n = self.screens.len();
-            match n {
-                0 => {
-                    ui.label("No screens yet…");
-                }
-                1 => {
-                    // Single screen: occupy full area
-                    let screen = &mut self.screens[0];
-                    screen.update_texture(ctx);
-                    if let Some(tex) = &screen.texture {
-                        let avail = ui.available_size();
-                        ui.label(format!("tex_{}", screen.id));
-                        ui.image((tex.id(), avail));
-                    } else {
-                        ui.label("Waiting for frames…");
-                    }
-                }
-                _ => {
-                    // Multiple: grid tiling
-                    let cols = (n as f32).sqrt().ceil() as usize;
-                    ui.columns(cols, |uis| {
-                        for (i, screen) in self.screens.iter_mut().enumerate() {
-                            let col = i % cols;
-                            let avail = uis[col].available_size();
-                            screen.update_texture(ctx);
-                            if let Some(tex) = &screen.texture {
-                                uis[col].image((tex.id(), avail));
-                            } else {
-                                uis[col].label("Waiting…");
-                            }
+        for (i, screen) in self.screens.iter_mut().enumerate() {
+            screen.update_texture(ctx);
+
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of(format!("immediate_viewport_{}", i)),
+                egui::ViewportBuilder::default()
+                    .with_title("Immediate Viewport")
+                    .with_inner_size([200.0, 100.0]),
+                |ctx, class| {
+                    assert!(
+                        class == egui::ViewportClass::Immediate,
+                        "This egui backend doesn't support multiple viewports"
+                    );
+
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        if let Some(tex) = &screen.texture {
+                            ui.image((tex.id(), ui.available_size()));
+                        } else {
+                            ui.label("Waiting…");
                         }
                     });
-                }
-            }
-        });
+                },
+            );
 
-        // Throttle repaint to prevent OS 'not responding'
-        // ctx.request_repaint_after(Duration::from_millis(100));
-        // ctx.request_repaint();
+            // Throttle repaint to prevent OS 'not responding'
+            // ctx.request_repaint_after(Duration::from_millis(100));
+            // ctx.request_repaint();
+        }
     }
 }
 
