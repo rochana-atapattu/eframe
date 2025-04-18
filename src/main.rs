@@ -34,6 +34,33 @@ struct Screen {
     texture: Option<TextureHandle>,
 }
 
+impl Screen {
+    /// Poll incoming frames, update texture
+    fn update_texture(&mut self, ctx: &egui::Context) {
+        // Poll for new frames:
+        if let Ok(frame) = self.rx.try_recv() {
+            // Upload to egui texture:
+            let size = [frame.width, frame.height];
+            let image = egui::ColorImage::from_rgba_unmultiplied(size, &frame.pixels);
+            self.texture =
+                Some(ctx.load_texture(format!("tex_{}", self.id), image, TextureOptions::NEAREST));
+        }
+    }
+    /// Draw screen content
+    fn draw(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.group(|ui| {
+            ui.label(format!("Screen #{}: ", self.id));
+            self.update_texture(ctx);
+            if let Some(tex) = &self.texture {
+                let size = tex.size_vec2();
+                ui.image((tex.id(), size));
+            } else {
+                ui.label("Waiting for frames…");
+            }
+        });
+    }
+}
+
 struct MyApp {
     rt_handle: Handle,
     next_id: usize,
@@ -51,10 +78,11 @@ impl MyApp {
         }
     }
 
-    fn add_screen(&mut self) {
+    fn add_screen(&mut self, ctx: &egui::Context) {
         let url = std::mem::take(&mut self.new_url);
         let (tx, rx) = mpsc::unbounded_channel();
         let id = self.next_id;
+        let ctx = ctx.clone();
         self.next_id += 1;
 
         // Spawn the WS + decode task:
@@ -81,6 +109,7 @@ impl MyApp {
                     pixels,
                 });
                 tick += 1;
+                ctx.request_repaint();
             }
         });
 
@@ -100,43 +129,52 @@ impl eframe::App for MyApp {
                 ui.label("WebSocket URL:");
                 ui.text_edit_singleline(&mut self.new_url);
                 if ui.button("Add screen").clicked() && !self.new_url.is_empty() {
-                    self.add_screen();
+                    self.add_screen(ctx);
                 }
             });
         });
 
+        // // Main area: dynamic tiling handling single vs multiple
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Lay out each screen in its own group:
-            for screen in &mut self.screens {
-                ui.group(|ui| {
-                    ui.label(format!("Screen #{}: {}", screen.id, screen.url));
-
-                    // Poll for new frames:
-                    while let Ok(frame) = screen.rx.try_recv() {
-                        // Upload to egui texture:
-                        let size = [frame.width, frame.height];
-                        let image = egui::ColorImage::from_rgba_unmultiplied(size, &frame.pixels);
-                        screen.texture = Some(ctx.load_texture(
-                            format!("tex_{}", screen.id),
-                            image,
-                            TextureOptions::NEAREST,
-                        ));
-                    }
-
-                    // Draw the last texture if any:
+            let n = self.screens.len();
+            match n {
+                0 => {
+                    ui.label("No screens yet…");
+                }
+                1 => {
+                    // Single screen: occupy full area
+                    let screen = &mut self.screens[0];
+                    screen.update_texture(ctx);
                     if let Some(tex) = &screen.texture {
-                        // Keep aspect ratio:
-                        ui.image(tex);
+                        let avail = ui.available_size();
+                        ui.label(format!("tex_{}", screen.id));
+                        ui.image((tex.id(), avail));
                     } else {
-                        ui.label("Waiting for first frame…");
+                        ui.label("Waiting for frames…");
                     }
-                });
-                ui.separator();
+                }
+                _ => {
+                    // Multiple: grid tiling
+                    let cols = (n as f32).sqrt().ceil() as usize;
+                    ui.columns(cols, |uis| {
+                        for (i, screen) in self.screens.iter_mut().enumerate() {
+                            let col = i % cols;
+                            let avail = uis[col].available_size();
+                            screen.update_texture(ctx);
+                            if let Some(tex) = &screen.texture {
+                                uis[col].image((tex.id(), avail));
+                            } else {
+                                uis[col].label("Waiting…");
+                            }
+                        }
+                    });
+                }
             }
         });
 
-        // Request repaint so we animate as frames come in:
-        ctx.request_repaint();
+        // Throttle repaint to prevent OS 'not responding'
+        // ctx.request_repaint_after(Duration::from_millis(100));
+        // ctx.request_repaint();
     }
 }
 
@@ -148,8 +186,6 @@ fn main() -> eframe::Result {
         .expect("failed to build runtime");
 
     let rt_handle = rt.handle().clone();
-    // Prevent the runtime from dropping:
-    let _guard = rt.enter();
 
     let app = MyApp::new(rt_handle);
 
@@ -159,6 +195,7 @@ fn main() -> eframe::Result {
         native_options,
         Box::new(|cc| {
             // cc (CreationContext) provides egui context if needed for setup
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             Ok(Box::<MyApp>::new(app))
         }),
     )
