@@ -1,51 +1,33 @@
-// Cargo.toml
-// ------------
-// [package]
-// name = "eframe_multiscreen_ws"
-// version = "0.1.0"
-// edition = "2021"
-//
-// [dependencies]
-// eframe = "0.21"
-// egui = "0.21"
-// tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-// tokio-tungstenite = "0.17"
-// futures = "0.3"
-// image = "0.24"
-// bytes = "1.4"
-
-use std::fmt::format;
-
-use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
+use eframe::egui;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::runtime;
 use tokio::runtime::Handle;
-use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
-
-// A decoded RGBA frame ready for egui:
-struct Frame {
-    width: usize,
-    height: usize,
-    pixels: Vec<u8>, // RGBA8
-}
 
 struct Screen {
     id: usize,
-    url: String,
-    rx: mpsc::UnboundedReceiver<Frame>,
-    texture: Option<TextureHandle>,
+    label: String,
+    visible: Arc<AtomicBool>,
+    texture: Arc<Mutex<egui::TextureHandle>>,
 }
 
 impl Screen {
-    /// Poll incoming frames, update texture
-    fn update_texture(&mut self, ctx: &egui::Context) {
-        // Poll for new frames:
-        if let Ok(frame) = self.rx.try_recv() {
-            // Upload to egui texture:
-            let size = [frame.width, frame.height];
-            let image = egui::ColorImage::from_rgba_unmultiplied(size, &frame.pixels);
-            self.texture =
-                Some(ctx.load_texture(format!("tex_{}", self.id), image, TextureOptions::NEAREST));
+    fn new(id: usize, label: String, ctx: &egui::Context) -> Self {
+        // Create a placeholder 1x1 transparent image
+        let empty = egui::ColorImage::example();
+        let handle = ctx.load_texture(
+            format!("tex_{}", id),
+            empty,
+            egui::TextureOptions::default(),
+        );
+        Self {
+            id,
+            label,
+            visible: Arc::new(AtomicBool::new(true)),
+            texture: Arc::new(Mutex::new(handle)),
         }
     }
 }
@@ -53,7 +35,7 @@ impl Screen {
 struct MyApp {
     rt_handle: Handle,
     next_id: usize,
-    new_url: String,
+    new_label: String,
     screens: Vec<Screen>,
 }
 
@@ -62,98 +44,98 @@ impl MyApp {
         Self {
             rt_handle,
             next_id: 0,
-            new_url: "".into(),
+            new_label: String::new(),
             screens: Vec::new(),
         }
     }
 
     fn add_screen(&mut self, ctx: &egui::Context) {
-        let url = std::mem::take(&mut self.new_url);
-        let (tx, rx) = mpsc::unbounded_channel();
+        let label = std::mem::take(&mut self.new_label);
         let id = self.next_id;
-        let ctx = ctx.clone();
         self.next_id += 1;
 
-        // Spawn the WS + decode task:
-        self.rt_handle.spawn(async move {
-            let mut tick: u64 = 0;
-            let mut interval = interval(Duration::from_millis(500));
-            let width = 200;
-            let height = 200;
-            loop {
-                interval.tick().await;
-                let r = ((tick * 50) % 256) as u8;
-                let g = ((tick * 80) % 256) as u8;
-                let b = ((tick * 110) % 256) as u8;
+        // Initialize screen with placeholder texture
+        let screen = Screen::new(id, label.clone(), ctx);
+        let texture = screen.texture.clone();
+        let ctx_clone = ctx.clone();
 
-                // Create a solid-color frame:
-                let mut pixels = Vec::with_capacity(width * height * 4);
-                for _ in 0..(width * height) {
-                    pixels.extend_from_slice(&[r, g, b, 255]);
+        // Spawn dummy stream task that updates the texture directly
+        self.rt_handle.spawn(async move {
+            let mut tick = 0u64;
+            let mut intv = interval(Duration::from_millis(500));
+            let (w, h) = (200, 200);
+            loop {
+                intv.tick().await;
+                // Generate solid-color frame
+                let color = [
+                    ((tick * 50) % 256) as u8,
+                    ((tick * 80) % 256) as u8,
+                    ((tick * 110) % 256) as u8,
+                    255,
+                ];
+                let pixels = std::iter::repeat(color)
+                    .take(w * h)
+                    .flat_map(|c| c)
+                    .collect::<Vec<u8>>();
+                let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels);
+
+                // Update texture inside mutex
+                if let Ok(mut guard) = texture.lock() {
+                    guard.set(img, egui::TextureOptions::default());
                 }
 
-                let _ = tx.send(Frame {
-                    width,
-                    height,
-                    pixels,
-                });
+                // Request repaint
+                ctx_clone.request_repaint_of(egui::ViewportId::from_hash_of(screen.id as u64));
                 tick += 1;
-                ctx.request_repaint();
             }
         });
 
-        self.screens.push(Screen {
-            id,
-            url,
-            rx,
-            texture: None,
-        });
+        self.screens.push(screen);
     }
 }
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+        // Top bar: add new screens
+        egui::TopBottomPanel::top("add_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("WebSocket URL:");
-                ui.text_edit_singleline(&mut self.new_url);
-                if ui.button("Add screen").clicked() && !self.new_url.is_empty() {
+                ui.label("Label:");
+                ui.text_edit_singleline(&mut self.new_label);
+                if ui.button("Add").clicked() && !self.new_label.is_empty() {
                     self.add_screen(ctx);
                 }
             });
         });
 
-        for (i, screen) in self.screens.iter_mut().enumerate() {
-            screen.update_texture(ctx);
-
-            ctx.show_viewport_immediate(
-                egui::ViewportId::from_hash_of(format!("immediate_viewport_{}", i)),
-                egui::ViewportBuilder::default()
-                    .with_title("Immediate Viewport")
-                    .with_inner_size([200.0, 100.0]),
-                |ctx, class| {
-                    assert!(
-                        class == egui::ViewportClass::Immediate,
-                        "This egui backend doesn't support multiple viewports"
-                    );
-
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        if let Some(tex) = &screen.texture {
-                            ui.image((tex.id(), ui.available_size()));
-                        } else {
-                            ui.label("Waiting…");
+        // Deferred viewports
+        for scr in &self.screens {
+            if scr.visible.load(Ordering::Relaxed) {
+                let vis = scr.visible.clone();
+                let texture = scr.texture.clone();
+                let title = scr.label.clone();
+                let id = egui::ViewportId::from_hash_of(scr.id as u64);
+                ctx.show_viewport_deferred(
+                    id,
+                    egui::ViewportBuilder::default()
+                        .with_title(title)
+                        .with_inner_size([300.0, 300.0]),
+                    move |ctx, _class| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let size = ui.available_size();
+                            if let Ok(lock) = texture.lock() {
+                                let tex = &*lock;
+                                ui.image((tex.id(), size));
+                            }
+                        });
+                        if ctx.input(|i| i.viewport().close_requested()) {
+                            vis.store(false, Ordering::Relaxed);
                         }
-                    });
-                },
-            );
-
-            // Throttle repaint to prevent OS 'not responding'
-            // ctx.request_repaint_after(Duration::from_millis(100));
-            // ctx.request_repaint();
+                    },
+                );
+            }
         }
     }
 }
-
 fn main() -> eframe::Result {
     // Build a multithreaded runtime on which we can spawn tasks:
     let rt = runtime::Builder::new_multi_thread()
