@@ -13,3 +13,6 @@ flume = "0.10"
 image = "0.24"
 # For image support:
 egui_extras = { version = "0.31.1", features = ["default", "image"] }
+# Logging
+tracing = { version = "0.1", features = ["log"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
