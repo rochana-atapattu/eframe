@@ -20,7 +20,19 @@ struct Screen {
 }
 
 impl Screen {
-    fn new(id: usize, label: String, rx: watch::Receiver<egui::ColorImage>) -> Self {
+    fn new(
+        ctx: &egui::Context,
+        id: usize,
+        label: String,
+        rx: watch::Receiver<egui::ColorImage>,
+    ) -> Self {
+        // Create a placeholder 1x1 transparent image
+        let empty = egui::ColorImage::example();
+        let handle = ctx.load_texture(
+            format!("tex_{}", id),
+            empty,
+            egui::TextureOptions::default(),
+        );
         Self {
             id,
             label,
@@ -56,7 +68,7 @@ impl MyApp {
         // placeholder so watch always has something
         let placeholder = egui::ColorImage::example();
         let (tx, rx) = watch::channel(placeholder);
-        let screen = Screen::new(id, label, rx);
+        let screen = Screen::new(ctx, id, label.clone(), rx);
 
         // spawn your frame‐producer task
         let ctx_clone = ctx.clone();
@@ -75,11 +87,11 @@ impl MyApp {
                 let pixels = std::iter::repeat(color)
                     .take(w * h)
                     .flat_map(|c| c)
-                    .collect::<Vec<_>>();
+                    .collect::<Vec<u8>>();
                 let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels);
+                ctx_clone.request_repaint_of(egui::ViewportId::from_hash_of(screen.id as u64));
                 let _ = tx.send(img);
                 debug!("sent");
-                ctx_clone.request_repaint_of(egui::ViewportId::from_hash_of(screen.id as u64));
                 tick += 1;
             }
         });
