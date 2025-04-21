@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 use tokio::{runtime, runtime::Handle, sync::watch, time::interval};
+use tracing_subscriber::field::debug;
 
 struct Screen {
     id: usize,
@@ -55,6 +56,7 @@ impl MyApp {
         // placeholder so watch always has something
         let placeholder = egui::ColorImage::example();
         let (tx, rx) = watch::channel(placeholder);
+        let screen = Screen::new(id, label, rx);
 
         // spawn your frame‐producer task
         let ctx_clone = ctx.clone();
@@ -76,12 +78,13 @@ impl MyApp {
                     .collect::<Vec<_>>();
                 let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels);
                 let _ = tx.send(img);
-                ctx_clone.request_repaint_of(egui::ViewportId::from_hash_of(id as u64));
+                debug!("sent");
+                ctx_clone.request_repaint_of(egui::ViewportId::from_hash_of(screen.id as u64));
                 tick += 1;
             }
         });
 
-        self.screens.push(Screen::new(id, label, rx));
+        self.screens.push(screen);
     }
 }
 
