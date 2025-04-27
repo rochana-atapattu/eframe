@@ -16,3 +16,4 @@ egui_extras = { version = "0.31.1", features = ["default", "image"] }
 # Logging
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+crossbeam = "0.8.4"

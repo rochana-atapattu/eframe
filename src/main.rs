@@ -1,6 +1,8 @@
 #[macro_use]
 extern crate tracing;
+use crossbeam::channel::{Receiver, Sender, unbounded};
 use eframe::{egui, glow::DEPTH_FUNC};
+use std::cell::RefCell;
 use std::{
     sync::{
         Arc,
@@ -8,38 +10,104 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{runtime, runtime::Handle, sync::watch, time::interval};
+use tokio::{runtime, runtime::Handle, time::interval};
 use tracing_subscriber::field::debug;
 
 struct Screen {
+    rt_handle: Handle,
     id: usize,
     label: String,
     visible: Arc<AtomicBool>,
-    rx_frame: watch::Receiver<egui::ColorImage>,
     texture: Option<egui::TextureHandle>,
+    // tx lives on the UI‐thread struct, but can be cloned and sent into the background task
+    tx: Sender<egui::ColorImage>,
+    // rx is only ever touched on the UI thread in the callback,
+    // so we can wrap it in RefCell for interior mutability
+    rx: Receiver<egui::ColorImage>,
 }
 
 impl Screen {
-    fn new(
-        ctx: &egui::Context,
-        id: usize,
-        label: String,
-        rx: watch::Receiver<egui::ColorImage>,
-    ) -> Self {
+    fn new(id: usize, label: String, rt_handle: Handle) -> Self {
+        let (tx, rx) = unbounded::<egui::ColorImage>();
         // Create a placeholder 1x1 transparent image
-        let empty = egui::ColorImage::example();
-        let handle = ctx.load_texture(
-            format!("tex_{}", id),
-            empty,
-            egui::TextureOptions::default(),
-        );
         Self {
+            rt_handle,
             id,
             label,
             visible: Arc::new(AtomicBool::new(true)),
-            rx_frame: rx,
             texture: None,
+            tx,
+            rx,
         }
+    }
+
+    /// Now borrows &mut self instead of consuming.
+    fn start(&mut self, ctx: egui::Context) {
+        // clone only what we need into the task
+        let tx = self.tx.clone();
+        let visible = self.visible.clone();
+        let id = self.id;
+        let mut ctx = ctx.clone();
+
+        self.rt_handle.spawn(async move {
+            let mut tick = 0u64;
+            let mut intv = interval(Duration::from_millis(500));
+            let (w, h) = (200, 200);
+            loop {
+                intv.tick().await;
+                let color = [
+                    ((tick * 50) % 256) as u8,
+                    ((tick * 80) % 256) as u8,
+                    ((tick * 110) % 256) as u8,
+                    255,
+                ];
+                let pixels = std::iter::repeat(color)
+                    .take(w * h)
+                    .flat_map(|c| c)
+                    .collect::<Vec<u8>>();
+                let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels);
+
+                // ask egui for a repaint
+
+                // actually send the image
+                if let Err(e) = tx.send(img) {
+                    debug!("{}: failed to send image: {:?}", id, e);
+                    // if the receiver is gone, stop the loop
+                    visible.store(false, Ordering::Relaxed);
+                    break;
+                }
+                ctx.request_repaint();
+                debug!("{}: sent image", id);
+                tick += 1;
+            }
+        });
+    }
+
+    fn viewport_callback(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        // pull in any new frames
+        while let Ok(img) = self.rx.try_recv() {
+            if let Some(tex_handle) = &mut self.texture {
+                tex_handle.set(img.clone(), egui::TextureOptions::default());
+            } else {
+                let handle = ctx.load_texture(
+                    format!("tex_{}", self.id),
+                    img.clone(),
+                    egui::TextureOptions::default(),
+                );
+                self.texture = Some(handle);
+            }
+        }
+
+        // now draw whatever texture we have
+        if let Some(tex_handle) = &self.texture {
+            let tex_id = tex_handle.id();
+            ui.image((tex_id, ui.available_size()));
+        }
+
+        // close-requested?
+        // if ctx.input(|i| i.close_requested()) {
+        //     self.visible.store(false, Ordering::Relaxed);
+        // }
     }
 }
 
@@ -65,37 +133,11 @@ impl MyApp {
         let id = self.next_id;
         self.next_id += 1;
 
-        // placeholder so watch always has something
-        let placeholder = egui::ColorImage::example();
-        let (tx, rx) = watch::channel(placeholder);
-        let screen = Screen::new(ctx, id, label.clone(), rx);
-
         // spawn your frame‐producer task
-        let ctx_clone = ctx.clone();
-        self.rt_handle.spawn(async move {
-            let mut tick = 0u64;
-            let mut intv = interval(Duration::from_millis(500));
-            let (w, h) = (200, 200);
-            loop {
-                intv.tick().await;
-                let color = [
-                    ((tick * 50) % 256) as u8,
-                    ((tick * 80) % 256) as u8,
-                    ((tick * 110) % 256) as u8,
-                    255,
-                ];
-                let pixels = std::iter::repeat(color)
-                    .take(w * h)
-                    .flat_map(|c| c)
-                    .collect::<Vec<u8>>();
-                let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels);
-                ctx_clone.request_repaint_of(egui::ViewportId::from_hash_of(screen.id as u64));
-                let _ = tx.send(img);
-                debug!("sent");
-                tick += 1;
-            }
-        });
+        let mut screen = Screen::new(id, label.clone(), self.rt_handle.clone());
+        screen.start(ctx.clone());
 
+        // fix error: use of moved value: screen
         self.screens.push(screen);
     }
 }
@@ -117,44 +159,12 @@ impl eframe::App for MyApp {
         // — for each screen, pull & paint —
         for scr in &mut self.screens {
             if scr.visible.load(Ordering::Relaxed) {
-                // 1) pull any new frame
-                if scr.rx_frame.has_changed().unwrap_or(false) {
-                    let img = scr.rx_frame.borrow_and_update().clone();
-                    match &mut scr.texture {
-                        Some(tex) => tex.set(img, egui::TextureOptions::default()),
-                        None => {
-                            let handle = ctx.load_texture(
-                                format!("tex_{}", scr.id),
-                                img.clone(),
-                                egui::TextureOptions::default(),
-                            );
-                            scr.texture = Some(handle);
-                        }
-                    }
-                }
-
                 // 2) prepare the values the closure needs
-                if let Some(tex) = &scr.texture {
-                    let vis = scr.visible.clone();
-                    let title = scr.label.clone();
-                    let view_id = egui::ViewportId::from_hash_of(scr.id as u64);
-                    let tex_id = tex.id();
-
-                    ctx.show_viewport_deferred(
-                        view_id,
-                        egui::ViewportBuilder::default()
-                            .with_title(title)
-                            .with_inner_size([300.0, 300.0]),
-                        move |ctx, _| {
-                            egui::CentralPanel::default().show(ctx, |ui| {
-                                ui.image((tex_id, ui.available_size()));
-                            });
-                            if ctx.input(|i| i.viewport().close_requested()) {
-                                vis.store(false, Ordering::Relaxed);
-                            }
-                        },
-                    );
-                }
+                egui::Window::new(&scr.label)
+                    .default_size([300.0, 300.0])
+                    .show(ctx, |ui| {
+                        scr.viewport_callback(ctx, ui);
+                    });
             }
         }
     }
@@ -174,7 +184,7 @@ fn main() -> eframe::Result {
 
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
-        "",
+        "image",
         native_options,
         Box::new(|cc| {
             // cc (CreationContext) provides egui context if needed for setup
